@@ -25,7 +25,7 @@ import java.util.Arrays;
  * <ul>
  *   <li>{@code sections} is the authoritative set of every attached section.
  *       It is used for world-coordinate lookup and for rebuilding the window.</li>
- *   <li>The lattice is a dense X/Z window containing the attached sections
+ *   <li>The lattice is a dense X/Y/Z window containing the attached sections
  *       that can participate in the current search. A section outside that
  *       window remains attached, but has no lattice slot until a rebase brings
  *       it inside the window.</li>
@@ -36,14 +36,14 @@ import java.util.Arrays;
  *
  * <p>The arrays are parallel: for a given lattice index,
  * {@code latticeSection}, {@code sectionMeta}, and {@code regionOfCell}
- * describe the same cell. X and Z are camera-windowed, while Y covers the
- * entire world height. The window is allocated lazily by
+ * describe the same cell. All three axes are camera-windowed; Y covers the
+ * entire world height when it fits in that window. The window is allocated lazily by
  * {@link #ensureWindowCovers}. The first call allocates the arrays and then
  * establishes their base coordinates. If a later camera position no longer
  * fits, a same-sized window is normally slid in place: the overlapping cells
  * are copied, and only the newly exposed X/Z band is looked up in
  * {@code sections}. A resize or a move with no overlap falls back to a full
- * {@link #rebase}.
+ * {@link #rebase}. Vertical moves also rebase, retaining the attached sections.
  *
  * <p>The installable interior ({@code [1, dim-2]} on each axis) is wrapped by
  * a permanent one-cell ring of sentinel cells (index {@code 0} and
@@ -60,7 +60,8 @@ import java.util.Arrays;
  * detachment, metadata updates, allocation, and rebasing must not overlap the
  * search. The search may run asynchronously and writes per-frame visit state
  * itself, but its array lengths, window coordinates, and installed membership
- * must remain stable for its duration. {@code RenderListManager} enforces this
+ * must remain stable for its duration. {@code SectionGraph} orders window preparation and searches,
+ * and {@code RenderListManager} enforces this
  * boundary.
  */
 public final class SectionLattice {
@@ -153,12 +154,9 @@ public final class SectionLattice {
     long[] visibleCells = new long[0];
     int visibleCount;
 
-    // Y is never windowed: the complete world height plus one sentinel cell at each vertical edge.
-    final int dimY;
-    final int baseY;
-    int dimX, dimZ;
-    // baseX/baseZ become meaningful after the first rebase; baseY is fixed by the world-height bounds.
-    int baseX, baseZ;
+    int dimX, dimY, dimZ;
+    // Base coordinates become meaningful after the first rebase.
+    int baseX, baseY, baseZ;
     // Linear offset for one neighbour step in each direction; the sentinel border makes every step safe.
     final int[] delta = new int[GraphDirection.COUNT];
     private int strideX, strideZ;
@@ -200,17 +198,15 @@ public final class SectionLattice {
      *                      visit-state array
      */
     public SectionLattice(int minSectionY, int maxSectionY, boolean hasShadowPass, boolean rasterOcclusion) {
+        if (maxSectionY <= minSectionY) {
+            throw new IllegalArgumentException("Empty world height range");
+        }
         this.minSectionY = minSectionY;
         this.maxSectionY = maxSectionY;
-        this.baseY = minSectionY - 1;
-        this.dimY = (maxSectionY - minSectionY) + 2;
         this.culler = new OcclusionCuller(this, minSectionY, maxSectionY, rasterOcclusion);
         this.shadowCuller = hasShadowPass ? new ShadowOcclusionCuller(this) : null;
         this.rasterOcclusion = rasterOcclusion;
 
-        if (this.dimY > MAX_DIM) {
-            throw new IllegalStateException("World height " + this.dimY + " exceeds occlusion lattice limit " + MAX_DIM);
-        }
     }
 
     /**
@@ -418,13 +414,13 @@ public final class SectionLattice {
      * retained and only the newly exposed band is resolved through the
      * authoritative section map.
      *
-     * <p>Call this on the render thread before dispatching a search. The
-     * asynchronous search must not observe allocation, rebasing, attachment,
-     * detachment, or metadata updates while it is running.
+     * <p>Call this as part of the serialized search task, before traversal. No
+     * other search or structural mutation may overlap preparation or traversal.
      */
     public void ensureWindowCovers(Vector3ic cameraSectionPos, float searchDistance) {
         int radius = MathUtil.mojfloor(searchDistance / 16.0f);
         int neededDimXZ = 2 * (radius + SLACK) + 3;
+        int oldBaseX = this.baseX, oldBaseY = this.baseY, oldBaseZ = this.baseZ;
 
         if (this.visitState == null || neededDimXZ > this.dimX) {
             this.allocate(neededDimXZ);
@@ -432,29 +428,57 @@ public final class SectionLattice {
 
         int lx = cameraSectionPos.x() - this.baseX;
         int lz = cameraSectionPos.z() - this.baseZ;
+        // Keep the boundary plane available when the camera is outside the world.
+        int centerY = Math.max(this.minSectionY, Math.min(this.maxSectionY - 1, cameraSectionPos.y()));
+        int ly = centerY - this.baseY;
 
         // Include the neighbour of the outermost section the traversal can visit.
         int reach = radius + 1;
 
-        boolean valid = this.established
+        boolean verticalValid = this.established
+                && (ly - reach >= 1 || this.baseY == this.minSectionY - 1)
+                && (ly + reach <= this.dimY - 2 || this.baseY + this.dimY - 1 == this.maxSectionY);
+        boolean valid = verticalValid
                 && lx - reach >= 1 && lx + reach <= this.dimX - 2
                 && lz - reach >= 1 && lz + reach <= this.dimZ - 2;
 
         if (!valid) {
             int newBaseX = cameraSectionPos.x() - this.dimX / 2;
             int newBaseZ = cameraSectionPos.z() - this.dimZ / 2;
+            // Preserve vertical slack when only X/Z needs to move, keeping the incremental path.
+            int newBaseY = verticalValid ? this.baseY : Math.max(this.minSectionY - 1,
+                    Math.min(this.maxSectionY - this.dimY + 1, centerY - this.dimY / 2));
 
-            if (this.established) {
+            if (this.established && newBaseY == this.baseY) {
                 // The current window is valid to slide from: reuse its retained
                 // contents and only resolve the newly exposed cells.
                 this.shiftRebase(newBaseX, newBaseZ);
             } else {
-                // Fresh or resized arrays have no reusable contents.
+                // A vertical shift changes every column's local indices.
+                this.baseY = newBaseY;
                 this.rebase(newBaseX, newBaseZ);
             }
 
+            this.remapVisibleCells(oldBaseX, oldBaseY, oldBaseZ);
             this.established = true;
         }
+    }
+
+    // A later shadow search may resize or move the window after the terrain search.
+    // Retain its receiver coordinates, not indices into the old window.
+    private void remapVisibleCells(int oldBaseX, int oldBaseY, int oldBaseZ) {
+        int retained = 0;
+        for (int i = 0; i < this.visibleCount; i++) {
+            int xyz = (int) (this.visibleCells[i] >>> 32);
+            int x = oldBaseX + ((xyz >>> (2 * XYZ_SHIFT)) & XYZ_LOCAL_MASK);
+            int y = oldBaseY + ((xyz >>> XYZ_SHIFT) & XYZ_LOCAL_MASK);
+            int z = oldBaseZ + (xyz & XYZ_LOCAL_MASK);
+            int idx = this.installedIndex(x, y, z);
+            if (idx >= 0) {
+                this.visibleCells[retained++] = ((long) this.packXyz(x, y, z) << 32) | (idx & 0xFFFFFFFFL);
+            }
+        }
+        this.visibleCount = retained;
     }
 
     /**
@@ -536,7 +560,8 @@ public final class SectionLattice {
     }
 
     private void allocate(int newDimXZ) {
-        long slotsLong = (long) newDimXZ * newDimXZ * this.dimY;
+        int newDimY = Math.min((this.maxSectionY - this.minSectionY) + 2, newDimXZ);
+        long slotsLong = (long) newDimXZ * newDimXZ * newDimY;
 
         if (newDimXZ > MAX_DIM || slotsLong >= MAX_LATTICE_SLOTS) {
             throw new IllegalStateException("Occlusion lattice window too large (dimXZ=" + newDimXZ
@@ -544,6 +569,7 @@ public final class SectionLattice {
         }
 
         this.dimX = newDimXZ;
+        this.dimY = newDimY;
         this.dimZ = newDimXZ;
         this.strideZ = this.dimY;
         this.strideX = this.dimY * this.dimZ;

@@ -29,6 +29,7 @@ public final class SectionGraph {
     // Number of submitted searches that have not been joined. While non-zero, structural mutations are forbidden
     // and metadata updates are deferred.
     private int inFlight;
+    private CompletableFuture<?> lastSearch = CompletableFuture.completedFuture(null);
 
     // Tasks deferred by submitUpdateTask() while a search is in flight. Drained on the render thread by
     // runDeferredTasks() once every search has been joined.
@@ -55,15 +56,32 @@ public final class SectionGraph {
 
     /**
      * Run a search task, on the search thread when {@code async} is set and an executor exists, otherwise inline.
-     * The caller must pair every submission with {@link #onSearchJoined()} after joining the returned future.
+     * The caller must pair every returned future with {@link #onSearchJoined()} after joining it.
+     * A submission that throws before returning a future is not counted as in flight.
      */
     <T> CompletableFuture<T> submit(Supplier<T> task, boolean async) {
         this.inFlight++;
 
-        if (async && this.executor != null) {
-            return CompletableFuture.supplyAsync(task, this.executor);
-        } else {
-            return CompletableFuture.completedFuture(task.get());
+        try {
+            if (async && this.executor != null) {
+                CompletableFuture<T> search = CompletableFuture.supplyAsync(task, this.executor);
+                this.lastSearch = search;
+                return search;
+            }
+
+            // ONLY_SHADOW mixes worker and render-thread searches. Window preparation
+            // is part of a search, so it must wait for any preceding worker search too.
+            this.lastSearch.join();
+            CompletableFuture<T> search = CompletableFuture.completedFuture(task.get());
+            this.lastSearch = search;
+            return search;
+        } catch (RuntimeException | Error failure) {
+            this.inFlight--;
+            // Propagate a predecessor's failure once without retaining a permanently failed barrier.
+            if (this.lastSearch.isCompletedExceptionally()) {
+                this.lastSearch = CompletableFuture.completedFuture(null);
+            }
+            throw failure;
         }
     }
 

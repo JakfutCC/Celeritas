@@ -106,10 +106,10 @@ public class RenderListManager {
             throw new IllegalStateException("startGraphUpdate is for the terrain pass; use startShadowGraphUpdate");
         }
 
-        this.lattice.ensureWindowCovers(viewport.getChunkCoord(), searchDistance);
-
-        this.submitSearch(frame, regionIdsLength, targetQueueSize, viewport, visitor ->
-                this.lattice.findVisible(visitor, viewport, searchDistance, regionIdsLength, useOcclusionCulling, true, frame));
+        this.submitSearch(frame, regionIdsLength, targetQueueSize, viewport, visitor -> {
+            this.lattice.ensureWindowCovers(viewport.getChunkCoord(), searchDistance);
+            return this.lattice.findVisible(visitor, viewport, searchDistance, regionIdsLength, useOcclusionCulling, true, frame);
+        });
     }
 
     /**
@@ -123,10 +123,10 @@ public class RenderListManager {
             throw new IllegalStateException("startShadowGraphUpdate is for the shadow pass; use startGraphUpdate");
         }
 
-        this.lattice.ensureWindowCovers(shadowViewport.getChunkCoord(), searchDistance);
-
-        this.submitSearch(frame, regionIdsLength, targetQueueSize, shadowViewport, visitor ->
-                this.lattice.findShadowVisible(visitor, shadowViewport, searchDistance, regionIdsLength, lightVector, frame));
+        this.submitSearch(frame, regionIdsLength, targetQueueSize, shadowViewport, visitor -> {
+            this.lattice.ensureWindowCovers(shadowViewport.getChunkCoord(), searchDistance);
+            return this.lattice.findShadowVisible(visitor, shadowViewport, searchDistance, regionIdsLength, lightVector, frame);
+        });
     }
 
     private void submitSearch(int frame, int regionIdsLength, int targetQueueSize, Viewport viewport,
